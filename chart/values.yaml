@@ -1,7 +1,7 @@
 replicaCount: 1
 
 image:
-  repository: vgurukool/dhana-lakshmi
+  repository: ayusing/dhana-lakshmi
   pullPolicy: IfNotPresent
   tag: "latest"
 
