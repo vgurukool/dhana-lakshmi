@@ -24,7 +24,7 @@ import { Spending } from './pages/Spending';
 import { Income } from './pages/Income';
 import { AddAccountModal } from './components/AddAccountModal';
 
-export function App() {
+export function App({ keycloak }) {
   const [activeTab, setActiveTab] = useState('dashboard');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
@@ -266,6 +266,7 @@ export function App() {
       <main className="main-content">
         {/* Top Header */}
         <Header
+          keycloak={keycloak}
           activeTab={activeTab}
           accounts={appState.accountsList || []}
           onOpenAddEntry={() => setIsAddEntryOpen(true)}

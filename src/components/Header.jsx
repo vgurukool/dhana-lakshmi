@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { RefreshCw, Upload, Plus, Sparkles, Coins, Bell, AlertCircle, CheckCircle2, X } from 'lucide-react';
 
 export function Header({
+  keycloak,
   activeTab,
   accounts = [],
   onOpenAddEntry,
@@ -180,6 +181,29 @@ export function Header({
           <Plus size={15} />
           <span>Add entry</span>
         </button>
+        {keycloak && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginLeft: '10px', paddingLeft: '10px', borderLeft: '1px solid #334155' }}>
+            <span style={{ fontSize: '12px', color: '#38BDF8', fontWeight: 600 }}>
+              👤 {keycloak.tokenParsed?.preferred_username || 'user'}
+            </span>
+            <button
+              onClick={() => keycloak.logout({ redirectUri: window.location.origin })}
+              title="Sign Out of Keycloak SSO"
+              style={{
+                background: '#EF4444',
+                border: 'none',
+                padding: '5px 10px',
+                borderRadius: '6px',
+                color: 'white',
+                fontSize: '11px',
+                fontWeight: 600,
+                cursor: 'pointer'
+              }}
+            >
+              Sign Out
+            </button>
+          </div>
+        )}
       </div>
     </header>
   );
