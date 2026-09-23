@@ -18,7 +18,8 @@ import {
   Target,
   FileText,
   Sliders,
-  Sun
+  Sun,
+  ExternalLink
 } from 'lucide-react';
 
 export function Settings({
@@ -445,8 +446,22 @@ export function Settings({
         </div>
         <div className="grid-3" style={{ fontSize: '13px', color: '#94A3B8' }}>
           <div>
-            <span style={{ fontWeight: 600, color: '#F8FAFC' }}>Folder Name:</span>
-            <div>{driveSyncInfo.folderName || 'Ledgerly Financial Inbox'}</div>
+            <span style={{ fontWeight: 600, color: '#F8FAFC' }}>Folder:</span>
+            <div>
+              {driveSyncInfo.folderUrl ? (
+                <a
+                  href={driveSyncInfo.folderUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  style={{ color: '#6558D3', textDecoration: 'none', display: 'inline-flex', alignItems: 'center', gap: '4px', fontWeight: 600 }}
+                >
+                  <span>{driveSyncInfo.folderName || 'Ledgerly Financial Inbox'}</span>
+                  <ExternalLink size={13} />
+                </a>
+              ) : (
+                driveSyncInfo.folderName || 'Ledgerly Financial Inbox'
+              )}
+            </div>
           </div>
           <div>
             <span style={{ fontWeight: 600, color: '#F8FAFC' }}>Schedule:</span>

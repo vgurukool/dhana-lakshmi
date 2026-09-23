@@ -3,12 +3,43 @@ import re
 from datetime import datetime
 from pypdf import PdfReader
 
+def extract_ordered_lines(page):
+    """Extract text fragments from a PDF page sorted in visual reading order (y desc, x asc)."""
+    parts = []
+    def visitor(text, cm, tm, font_dict, font_size):
+        if text.strip():
+            parts.append((tm[4], tm[5], text.strip()))
+    try:
+        page.extract_text(visitor_text=visitor)
+    except Exception:
+        return [[(0.0, l.strip())] for l in (page.extract_text() or "").splitlines() if l.strip()]
+    if not parts:
+        return [[(0.0, l.strip())] for l in (page.extract_text() or "").splitlines() if l.strip()]
+
+    parts.sort(key=lambda item: (-round(item[1], 1), round(item[0], 1)))
+    lines = []
+    curr_y = None
+    curr_line = []
+    for x, y, t in parts:
+        if curr_y is None or abs(y - curr_y) > 3.5:
+            if curr_line:
+                lines.append(curr_line)
+            curr_y = y
+            curr_line = [(x, t)]
+        else:
+            curr_line.append((x, t))
+    if curr_line:
+        lines.append(curr_line)
+    return lines
+
+
 def parse_pdf_bank_statement(pdf_bytes, options=None):
     if options is None:
         options = {}
     password = options.get("password") or "30031981"
 
     text = ""
+    reader = None
     try:
         reader = PdfReader(io.BytesIO(pdf_bytes))
         if reader.is_encrypted:
@@ -70,7 +101,7 @@ def parse_pdf_bank_statement(pdf_bytes, options=None):
             if total_match.lastindex and total_match.lastindex >= 2 and total_match.group(2):
                 maturity_val = float(total_match.group(2).replace(',', ''))
 
-        fd_matches = re.findall(r'5030\d{10}', text)
+        fd_matches = re.findall(r' 5030\d{10} ', text)
         fd_count = len(fd_matches) or 20
 
         return {
@@ -84,165 +115,171 @@ def parse_pdf_bank_statement(pdf_bytes, options=None):
             "transactions": []
         }
 
-    raw_lines = [l.strip() for l in text.splitlines() if l.strip()]
-    date_regex = re.compile(r'(\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}[-/.]\d{1,2}(?:[-/.]\d{2,4})?|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2})', re.IGNORECASE)
-    amount_regex = re.compile(r'([+-]?\$?\s*-?\s*\d{1,3}(?:,\d{3})*\.\d{2})')
-
-    # Pre-process lines
-    lines = []
-    i = 0
-    while i < len(raw_lines):
-        line = raw_lines[i]
-        if date_regex.search(line) and not amount_regex.search(line):
-            if i > 0:
-                prev_line = raw_lines[i - 1]
-                if amount_regex.search(prev_line) and not date_regex.search(prev_line):
-                    amt_match = amount_regex.findall(prev_line)
-                    if amt_match:
-                        line = f"{line} {amt_match[0]}"
-            if not amount_regex.search(line) and i + 1 < len(raw_lines):
-                next_line = raw_lines[i + 1]
-                if not date_regex.search(next_line) and amount_regex.search(next_line):
-                    amt_match = amount_regex.findall(next_line)
-                    if amt_match:
-                        line = f"{line} {amt_match[0]}"
-                        i += 1
-        lines.append(line)
-        i += 1
-
-    extracted_transactions = []
-    year_match = re.search(r'(202[4-9]|203[0-9])', text)
-    statement_year = year_match.group(1) if year_match else "2026"
-
-    extracted_account_name = "Imported account"
+    full_header = text[:2000].lower()
     last4 = ""
-
-    acct_match = re.search(r'Account\s*Number:?\s*(?:X+\s*)*([0-9A-Z]{4,16})', text, re.IGNORECASE) or re.search(r'Card\s*(\d{4})', text, re.IGNORECASE)
+    acct_match = re.search(r'Account\s*Number:?\s*(?:X+\s*)*([0-9A-Z]{4,16})', text, re.IGNORECASE) or re.search(r'Card\s*(\d{4})', text, re.IGNORECASE)
     if acct_match and acct_match.group(1):
         digits = re.sub(r'[^0-9]', '', acct_match.group(1))
         if len(digits) >= 4:
             last4 = digits[-4:]
 
-    header_text = ' '.join(raw_lines[:20]).lower()
-    if 'bank of america' in header_text or 'bofa' in header_text:
-        if 'checking' in header_text:
+    extracted_account_name = "Imported account"
+    is_credit_card = False
+
+    if "marriott" in full_header or ("chase" in full_header and any(k in full_header for k in ["credit card", "payment due date", "minimum payment", "autopay is on"])):
+        is_credit_card = True
+        if "marriott" in full_header:
+            extracted_account_name = f"Chase Marriott Bonvoy Card (...{last4})" if last4 else "Chase Marriott Bonvoy Card"
+        else:
+            extracted_account_name = f"Chase Credit Card (...{last4})" if last4 else "Chase Credit Card"
+    elif "chase private client checking" in full_header or ("chase" in full_header and "checking" in full_header):
+        extracted_account_name = f"Chase Private Client Checking (...{last4})" if last4 else "Chase Private Client Checking"
+    elif "chase private client savings" in full_header or ("chase" in full_header and "savings" in full_header):
+        extracted_account_name = f"Chase Private Client Savings (...{last4})" if last4 else "Chase Private Client Savings"
+    elif 'bank of america' in full_header or 'bofa' in full_header:
+        if 'checking' in full_header:
             extracted_account_name = f"Bank of America Checking (...{last4})" if last4 else "Bank of America Checking"
-        elif 'savings' in header_text:
+        elif 'savings' in full_header:
             extracted_account_name = f"Bank of America Savings (...{last4})" if last4 else "Bank of America Savings"
         else:
             extracted_account_name = f"Bank of America Card (...{last4})" if last4 else "Bank of America Account"
-    elif 'chase private client checking' in header_text or ('chase' in header_text and 'checking' in header_text):
-        extracted_account_name = f"Chase Private Client Checking (...{last4})" if last4 else "Chase Private Client Checking"
-    elif any(k in header_text for k in ['credit card', 'card', 'payment due', 'minimum payment', 'autopay']):
+            is_credit_card = True
+    elif any(k in full_header for k in ['payment due date', 'minimum payment due', 'credit card']):
         extracted_account_name = f"Credit Card (...{last4})" if last4 else "Credit Card"
-    elif 'checking' in header_text:
+        is_credit_card = True
+    elif 'checking' in full_header:
         extracted_account_name = f"Checking Account (...{last4})" if last4 else "Checking Account"
-    elif 'savings' in header_text:
+    elif 'savings' in full_header:
         extracted_account_name = f"Savings Account (...{last4})" if last4 else "Savings Account"
-    elif last4:
-        extracted_account_name = f"Credit Card (...{last4})"
 
-    interest_paid_val = 0.06
-    int_match = re.search(r'Interest Paid This Period\s*\$?([0-9.]+)', text, re.IGNORECASE)
-    if int_match:
-        try:
-            v = float(int_match.group(1))
-            if v > 0: interest_paid_val = v
-        except Exception:
-            pass
-
-    for line in lines:
-        lower_line = line.lower()
-        if any(ign in lower_line for ign in [
-            'beginning balance', 'ending balance', 'new balance', 'payment due date', 'payment due',
-            'customer service', 'account number', 'page ', 'chase.com', 'total fees charged',
-            'minimum payment due', 'total rewards', 'summary of accounts', 'annual percentage yield',
-            'interest paid year-to-date', 'interest paid this period', 'interest charge', 'my chase loan',
-            'balance transfers', 'cash advances', 'purchases v d', 'pay over time', 'fixed monthly fee',
-            'chase pay over time', 'interest charge calculation', 'service fees -', 'service fees',
-            'checks -', 'checks continued', 'deposits and other credits', 'withdrawals and other debits',
-            'daily periodic rate', 'annual percentage rate', 'fees -', 'total fees'
-        ]):
-            continue
-
-        d_match = date_regex.search(line)
-        amt_matches = amount_regex.findall(line)
-
-        if d_match and amt_matches:
-            raw_date = d_match.group(0)
-            iso_date = f"{statement_year}-07-01"
+    ending_balance = None
+    if is_credit_card:
+        new_bal_m = re.search(r"New Balance:?\s*\$?([0-9,]+\.\d{2})", text, re.IGNORECASE)
+        if new_bal_m:
             try:
-                parts = re.split(r'[-/.]', raw_date)
-                if len(parts) == 2:
-                    m = int(parts[0])
-                    d = int(parts[1])
-                    if 1 <= m <= 12 and 1 <= d <= 31:
-                        iso_date = f"{statement_year}-{str(m).zfill(2)}-{str(d).zfill(2)}"
-                else:
-                    d_parsed = datetime.strptime(raw_date, "%m/%d/%Y") if '/' in raw_date else datetime.fromisoformat(raw_date)
-                    iso_date = d_parsed.strftime("%Y-%m-%d")
+                ending_balance = float(new_bal_m.group(1).replace(",", ""))
+            except Exception:
+                pass
+    else:
+        end_bal_m = re.search(r"(?:Ending|Total|Closing)\s*(?:Account|Savings|Checking)?\s*Balance[^\n\d]*\$?\s*([0-9,]+\.\d{2})", text, re.IGNORECASE)
+        if end_bal_m:
+            try:
+                ending_balance = float(end_bal_m.group(1).replace(",", ""))
             except Exception:
                 pass
 
-            sel_amt_str = amt_matches[0].strip()
-            clean_amt = re.sub(r'[^0-9.-]', '', sel_amt_str)
-            numeric_amt = float(clean_amt) if clean_amt else 0.0
+    year_m = re.search(r"(?:through|Statement Date:?|Period:?)[^\n]*?(202[4-9]|203[0-9])", text) or re.search(r" (202[4-9]|203[0-9]) ", text)
+    statement_year = year_m.group(1) if year_m else str(datetime.now().year)
 
-            is_income = any(k in lower_line for k in ['payroll', 'zelle payment from', 'online transfer', 'interest payment', 'deposit', 'credit', '+'])
-            if 'interest payment' in lower_line:
-                numeric_amt = interest_paid_val
+    date_regex = re.compile(r"^(\d{1,2}/\d{1,2}(?:/\d{2,4})?)")
+    extracted_transactions = []
 
-            if numeric_amt != 0.0 and abs(numeric_amt) < 50000:
-                ttype = 'income' if (is_income and '-' not in sel_amt_str) else 'expense'
-                abs_amt = abs(numeric_amt)
+    if reader and reader.pages:
+        for page in reader.pages:
+            ordered_groups = extract_ordered_lines(page)
+            for group in ordered_groups:
+                line_str = " ".join([t for _, t in group]).strip()
+                d_match = date_regex.match(line_str)
+                if not d_match:
+                    continue
 
-                clean_merchant = line.replace(d_match.group(0), '')
-                for am in amt_matches:
-                    clean_merchant = clean_merchant.replace(am, '')
-                clean_merchant = re.sub(r'\d{1,3}(?:,\d{3})*\.\d{2}', '', clean_merchant)
-                clean_merchant = re.sub(r'[^\w\s*.-]', ' ', clean_merchant)
-                clean_merchant = re.sub(r'\s+', ' ', clean_merchant).strip()
+                raw_date = d_match.group(1)
+                rest = line_str[len(raw_date):].strip()
 
-                lower_m = clean_merchant.lower()
-                if any(k in lower_m for k in [
-                    'payment due date', 'new balance', 'minimum payment', 'payment due',
-                    'purchases v d', 'balance transfers', 'cash advances', 'pay over time',
-                    'fixed monthly fee', 'my chase loan', 'service fees', 'checks -', 'checks continued',
-                    'deposits and other credits', 'withdrawals and other debits', 'pdf statement entry'
+                lower_rest = rest.lower()
+                if any(ign in lower_rest for ign in [
+                    "beginning balance", "ending balance", "new balance",
+                    "payment due date", "payment due", "minimum payment due",
+                    "customer service", "total fees charged", "total interest charged"
                 ]):
                     continue
 
-                alpha_count = len(re.findall(r'[a-zA-Z]', clean_merchant))
-                if alpha_count < 3:
+                date_parts = raw_date.split("/")
+                if len(date_parts) == 2:
+                    iso_date = f"{statement_year}-{date_parts[0].zfill(2)}-{date_parts[1].zfill(2)}"
+                elif len(date_parts) == 3:
+                    yr = date_parts[2]
+                    if len(yr) == 2: yr = "20" + yr
+                    iso_date = f"{yr}-{date_parts[0].zfill(2)}-{date_parts[1].zfill(2)}"
+                else:
+                    iso_date = f"{statement_year}-01-01"
+
+                neg_m = re.search(r"-\s*([\d,]+\.\d{2})\s+([\d,]+\.\d{2})$", rest)
+                pos_two_m = re.search(r"([\d,]+\.\d{2})\s+([\d,]+\.\d{2})$", rest)
+                single_neg_m = re.search(r"-\s*([\d,]+\.\d{2})$", rest)
+                single_pos_m = re.search(r"\+?\s*([\d,]+\.\d{2})$", rest)
+
+                amount = 0.0
+                merchant = rest
+                ttype = "expense"
+
+                if neg_m:
+                    amount = float(neg_m.group(1).replace(",", ""))
+                    merchant = rest[:neg_m.start()].strip()
+                    ttype = "expense"
+                elif pos_two_m:
+                    v1 = float(pos_two_m.group(1).replace(",", ""))
+                    v2 = float(pos_two_m.group(2).replace(",", ""))
+                    merchant = rest[:pos_two_m.start()].strip()
+                    ttype = "income"
+                    if v1 > v2 and v1 > 5000 and v2 < 5000:
+                        amount = v2
+                    else:
+                        amount = v1
+                elif single_neg_m:
+                    amount = float(single_neg_m.group(1).replace(",", ""))
+                    merchant = rest[:single_neg_m.start()].strip()
+                    ttype = "income" if is_credit_card else "expense"
+                elif single_pos_m:
+                    amount = float(single_pos_m.group(1).replace(",", ""))
+                    merchant = rest[:single_pos_m.start()].strip()
+                    ttype = "expense" if is_credit_card else "income"
+                else:
                     continue
 
-                category = 'Income' if is_income else 'Needs review'
-                if any(k in lower_m for k in ['credit crd', 'credit card', 'card autopay', 'citi autopay', 'payment to card', 'transfer to checking']):
-                    category = 'Credit Card Payment'
-                elif any(k in lower_m for k in ['transfer', 'xfer', 'online transfer', 'internal transfer']):
-                    category = 'Transfer'
-                elif any(k in lower_m for k in ['withdrawal', 'atm', 'cash withdraw']):
-                    category = 'Cash Withdrawal'
+                if amount == 0.0 or amount > 1000000:
+                    continue
+
+                merchant = re.sub(r"PPD ID:\s*\S+", "", merchant)
+                merchant = re.sub(r"Web ID:\s*\S+", "", merchant)
+                merchant = re.sub(r"Transaction\s*#:\s*\S+", "", merchant)
+                merchant = re.sub(r"^\d{2}/\d{2}\s+", "", merchant)
+                merchant = re.sub(r"\s+", " ", merchant).strip()
+
+                if len(re.findall(r'[a-zA-Z]', merchant)) < 2:
+                    continue
+
+                category = "Needs review"
+                low_m = merchant.lower()
+                if any(k in low_m for k in ["payroll", "interest payment", "zelle payment from", "direct deposit"]):
+                    category = "Income"
+                    ttype = "income"
+                elif any(k in low_m for k in ["automatic payment", "autopay", "thank you", "citi autopay", "payment to card"]):
+                    category = "Credit Card Payment"
+                elif any(k in low_m for k in ["online transfer", "transfer to", "transfer from", "xfer"]):
+                    category = "Transfer"
+                elif any(k in low_m for k in ["grocers", "wal-mart", "kroger", "trader joe", "parivar", "subhlaxmi"]):
+                    category = "Groceries"
+                elif any(k in low_m for k in ["chipotle", "subway", "domino", "biryani", "sweets", "food", "baguette", "starbucks", "deli"]):
+                    category = "Dining & Food"
+                elif any(k in low_m for k in ["energy", "cpenergy", "tmobile", "att*", "verizon", "electric"]):
+                    category = "Utilities & Bills"
+                elif any(k in low_m for k in ["insurance", "aaa tx"]):
+                    category = "Insurance"
+                elif any(k in low_m for k in ["home depot", "office depot", "michaels", "dollar tree"]):
+                    category = "Shopping"
 
                 extracted_transactions.append({
                     "date": iso_date,
-                    "merchant": clean_merchant,
-                    "amount": abs_amt,
+                    "merchant": merchant,
+                    "amount": round(amount, 2),
                     "type": ttype,
                     "category": category,
                     "account": extracted_account_name,
-                    "tags": ['PDF Import'],
+                    "tags": ["PDF Import"],
                     "receipt": True,
-                    "source": 'document'
+                    "source": "document"
                 })
-
-    ending_balance = None
-    end_bal_match = re.search(r'(?:Ending|Total|Closing)\s*(?:Account|Savings|Checking)?\s*Balance[^\n\d]*\$?\s*([0-9,]+\.\d{2})', text, re.IGNORECASE)
-    if end_bal_match:
-        try:
-            ending_balance = float(end_bal_match.group(1).replace(',', ''))
-        except Exception:
-            pass
 
     return {
         "textLength": len(text),
@@ -253,6 +290,4 @@ def parse_pdf_bank_statement(pdf_bytes, options=None):
         "reviewNeeded": False
     }
 
-
-# Alias for multi-bank connector
 parse_pdf_bytes_sync = parse_pdf_bank_statement

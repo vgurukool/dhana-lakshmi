@@ -184,7 +184,7 @@ export function Header({
         {keycloak && (
           <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginLeft: '10px', paddingLeft: '10px', borderLeft: '1px solid #334155' }}>
             <span style={{ fontSize: '12px', color: '#38BDF8', fontWeight: 600 }}>
-              👤 {keycloak.tokenParsed?.preferred_username || 'user'}
+              👤 {keycloak.tokenParsed?.given_name || keycloak.tokenParsed?.firstName || keycloak.tokenParsed?.name || keycloak.tokenParsed?.preferred_username || 'Ayush'}
             </span>
             <button
               onClick={() => keycloak.logout({ redirectUri: window.location.origin })}

@@ -1,6 +1,7 @@
 import os
 import json
 import re
+import base64
 from pathlib import Path
 from typing import List, Optional, Union, Dict, Any
 from datetime import datetime
@@ -11,12 +12,14 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+import urllib.request
 from db import (
     init_db, get_state, save_transaction, patch_transaction, delete_transaction,
     get_assets, save_asset, patch_asset, delete_asset, update_preferences,
     save_document_record, delete_document_record, store_r2_object, wipe_all_data,
     deduplicate_transactions_in_db, apply_rules_to_all_transactions, sync_assets_setting,
-    get_financial_accounts, save_financial_account, patch_financial_account, delete_financial_account, mark_account_paid
+    get_financial_accounts, save_financial_account, patch_financial_account, delete_financial_account, mark_account_paid,
+    DEFAULT_USER_ID, STORAGE_BUCKET_DIR
 )
 from csv_parser import parse_csv_bank_statement
 from pdf_parser import parse_pdf_bank_statement
@@ -37,6 +40,57 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+def get_current_user(request: Request) -> dict:
+    """Extract authenticated user identity from Keycloak Bearer token or ingress headers."""
+    auth_header = request.headers.get("Authorization") or request.headers.get("authorization")
+    if auth_header and auth_header.startswith("Bearer "):
+        token = auth_header.split(" ", 1)[1].strip()
+        try:
+            parts = token.split(".")
+            if len(parts) >= 2:
+                payload_b64 = parts[1]
+                payload_b64 += "=" * ((4 - len(payload_b64) % 4) % 4)
+                payload_json = base64.urlsafe_b64decode(payload_b64.encode("utf-8")).decode("utf-8")
+                claims = json.loads(payload_json)
+                user_id = claims.get("sub") or claims.get("preferred_username") or DEFAULT_USER_ID
+                username = claims.get("preferred_username") or claims.get("name") or "ayush"
+                email = claims.get("email") or "ayush@vgurukool.com"
+                return {
+                    "user_id": user_id,
+                    "username": username,
+                    "email": email,
+                    "claims": claims
+                }
+        except Exception as e:
+            print(f"[AUTH] Error parsing Bearer token: {e}")
+
+    # Fallback to reverse-proxy headers if present
+    proxy_user = (
+        request.headers.get("X-Auth-Request-Preferred-Username") or
+        request.headers.get("X-Forwarded-User") or
+        request.headers.get("X-Auth-Request-User") or
+        request.headers.get("X-Auth-Request-Email")
+    )
+    if proxy_user:
+        if proxy_user in ["ayush", "ayush@vgurukool.com"]:
+            user_id = DEFAULT_USER_ID
+        else:
+            user_id = proxy_user
+        return {
+            "user_id": user_id,
+            "username": proxy_user,
+            "email": request.headers.get("X-Auth-Request-Email") or "",
+            "claims": {}
+        }
+
+    # Dev/direct fallback
+    return {
+        "user_id": DEFAULT_USER_ID,
+        "username": "ayush",
+        "email": "ayush@vgurukool.com",
+        "claims": {}
+    }
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 DIST_DIR = BASE_DIR / "dist"
 
@@ -51,18 +105,20 @@ def health_check():
 
 # 4.3 GET /api/state
 @app.get("/api/state")
-def api_get_state():
+def api_get_state(request: Request):
     try:
-        return get_state()
+        user = get_current_user(request)
+        return get_state(user["user_id"])
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 # 4.35 /api/accounts (Financial Accounts, Loans & Obligations)
 @app.get("/api/accounts")
-def api_get_accounts():
+def api_get_accounts(request: Request):
     try:
-        accounts = get_financial_accounts()
+        user = get_current_user(request)
+        accounts = get_financial_accounts(user["user_id"])
         return {"accounts": accounts}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -70,8 +126,9 @@ def api_get_accounts():
 @app.post("/api/accounts")
 async def api_save_account(request: Request):
     try:
+        user = get_current_user(request)
         data = await request.json()
-        saved = save_financial_account(data)
+        saved = save_financial_account(data, user["user_id"])
         return {"success": True, "account": saved}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -79,8 +136,9 @@ async def api_save_account(request: Request):
 @app.patch("/api/accounts/{account_id}")
 async def api_patch_account(account_id: str, request: Request):
     try:
+        user = get_current_user(request)
         patch_data = await request.json()
-        updated = patch_financial_account(account_id, patch_data)
+        updated = patch_financial_account(account_id, patch_data, user["user_id"])
         if not updated:
             raise HTTPException(status_code=404, detail="Account not found")
         return {"success": True, "account": updated}
@@ -90,9 +148,10 @@ async def api_patch_account(account_id: str, request: Request):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.delete("/api/accounts/{account_id}")
-def api_delete_account(account_id: str):
+def api_delete_account(account_id: str, request: Request):
     try:
-        deleted = delete_financial_account(account_id)
+        user = get_current_user(request)
+        deleted = delete_financial_account(account_id, user["user_id"])
         if not deleted:
             raise HTTPException(status_code=404, detail="Account not found")
         return {"success": True, "deletedId": account_id}
@@ -102,9 +161,10 @@ def api_delete_account(account_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/accounts/{account_id}/pay")
-def api_mark_account_paid(account_id: str):
+def api_mark_account_paid(account_id: str, request: Request):
     try:
-        updated = mark_account_paid(account_id)
+        user = get_current_user(request)
+        updated = mark_account_paid(account_id, user["user_id"])
         if not updated:
             raise HTTPException(status_code=404, detail="Account not found")
         return {"success": True, "account": updated, "message": "Payment recorded and next due date advanced to next cycle."}
@@ -117,6 +177,7 @@ def api_mark_account_paid(account_id: str):
 @app.post("/api/transactions")
 async def api_save_transactions(request: Request):
     try:
+        user = get_current_user(request)
         payload = await request.json()
         items = payload if isinstance(payload, list) else [payload]
 
@@ -127,7 +188,7 @@ async def api_save_transactions(request: Request):
         for item in items:
             if not item.get("merchant") or not item.get("date") or not item.get("amount") or float(item.get("amount") or 0) <= 0:
                 continue
-            res = save_transaction(item)
+            res = save_transaction(item, user["user_id"])
             if res.get("duplicate"):
                 duplicate_count += 1
             else:
@@ -146,8 +207,9 @@ async def api_save_transactions(request: Request):
 @app.patch("/api/transactions/{tx_id}")
 async def api_patch_transaction(tx_id: str, request: Request):
     try:
+        user = get_current_user(request)
         updates = await request.json()
-        updated = patch_transaction(tx_id, updates)
+        updated = patch_transaction(tx_id, updates, user["user_id"])
         if not updated:
             raise HTTPException(status_code=404, detail="Transaction not found")
         return updated
@@ -157,9 +219,10 @@ async def api_patch_transaction(tx_id: str, request: Request):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.delete("/api/transactions/{tx_id}")
-def api_delete_transaction(tx_id: str):
+def api_delete_transaction(tx_id: str, request: Request):
     try:
-        deleted = delete_transaction(tx_id)
+        user = get_current_user(request)
+        deleted = delete_transaction(tx_id, user["user_id"])
         if not deleted:
             raise HTTPException(status_code=404, detail="Transaction not found")
         return {"success": True, "deletedId": tx_id}
@@ -170,17 +233,19 @@ def api_delete_transaction(tx_id: str):
 
 # /api/assets Endpoints
 @app.get("/api/assets")
-def api_get_assets():
+def api_get_assets(request: Request):
     try:
-        return get_assets()
+        user = get_current_user(request)
+        return get_assets(user["user_id"])
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/assets")
 async def api_create_asset(request: Request):
     try:
+        user = get_current_user(request)
         asset_data = await request.json()
-        saved = save_asset(asset_data)
+        saved = save_asset(asset_data, user["user_id"])
         return {"success": True, "asset": saved}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -188,8 +253,9 @@ async def api_create_asset(request: Request):
 @app.patch("/api/assets/{asset_id}")
 async def api_patch_asset(asset_id: str, request: Request):
     try:
+        user = get_current_user(request)
         updates = await request.json()
-        updated = patch_asset(asset_id, updates)
+        updated = patch_asset(asset_id, updates, user["user_id"])
         if not updated:
             raise HTTPException(status_code=404, detail="Asset not found")
         return updated
@@ -199,9 +265,10 @@ async def api_patch_asset(asset_id: str, request: Request):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.delete("/api/assets/{asset_id}")
-def api_delete_asset(asset_id: str):
+def api_delete_asset(asset_id: str, request: Request):
     try:
-        deleted = delete_asset(asset_id)
+        user = get_current_user(request)
+        deleted = delete_asset(asset_id, user["user_id"])
         if not deleted:
             raise HTTPException(status_code=404, detail="Asset not found")
         return {"success": True, "deletedId": asset_id}
@@ -214,30 +281,144 @@ def api_delete_asset(asset_id: str):
 @app.put("/api/preferences")
 async def api_update_preferences(request: Request):
     try:
+        user = get_current_user(request)
         body = await request.json()
-        update_preferences(body)
-        apply_rules_to_all_transactions()
-        return get_state()["settings"]
+        update_preferences(body, user["user_id"])
+        apply_rules_to_all_transactions(user["user_id"])
+        return get_state(user["user_id"])["settings"]
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 # POST /api/rules/apply
 @app.post("/api/rules/apply")
-def api_apply_rules():
+def api_apply_rules(request: Request):
     try:
-        updated_count = apply_rules_to_all_transactions()
-        return {"success": True, "updatedCount": updated_count, "state": get_state()}
+        user = get_current_user(request)
+        updated_count = apply_rules_to_all_transactions(user["user_id"])
+        return {"success": True, "updatedCount": updated_count, "state": get_state(user["user_id"])}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+INCORG_URL = os.environ.get("INCORG_URL", "http://intelligent-content-organizer.incorg.svc.cluster.local:7860")
+
+def extract_document_via_incorg(file_bytes: bytes, filename: str, doc_type: str = "bank_statement", password: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Delegate document extraction to incorg service over REST API."""
+    try:
+        url = f"{INCORG_URL.rstrip('/')}/api/v1/extract"
+        boundary = f"----WebKitFormBoundary{int(datetime.now().timestamp()*1000)}"
+        hints = json.dumps({"password": password or "30031981"})
+
+        parts = (
+            f'--{boundary}\r\n'
+            f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+            f'Content-Type: application/pdf\r\n\r\n'
+        ).encode('utf-8') + file_bytes + (
+            f'\r\n--{boundary}\r\n'
+            f'Content-Disposition: form-data; name="doc_type"\r\n\r\n'
+            f'{doc_type}\r\n'
+            f'--{boundary}\r\n'
+            f'Content-Disposition: form-data; name="hints"\r\n\r\n'
+            f'{hints}\r\n'
+            f'--{boundary}--\r\n'
+        ).encode('utf-8')
+
+        req = urllib.request.Request(url, data=parts, headers={
+            'Content-Type': f'multipart/form-data; boundary={boundary}',
+            'Content-Length': str(len(parts))
+        })
+
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            if resp.status == 200:
+                data = json.loads(resp.read().decode('utf-8'))
+                if data.get("success"):
+                    return data
+    except Exception as e:
+        print(f"[Incorg Extraction] Note: delegating to incorg returned {e}, using local parser.")
+    return None
+
+def ingest_parsed_results(result: Dict[str, Any], user_id: str) -> int:
+    """Ingest extracted transactions, assets, folios, and balances into user state."""
+    extracted_count = 0
+    # Folios
+    folios = result.get("mutual_fund_folios") or result.get("folios") or []
+    for item in folios:
+        clean_scheme = re.sub(r'^[A-Z0-9]+-', '', item.get("scheme", "")).split('- ISIN')[0].strip() or "Mutual Fund"
+        save_asset({
+            "id": f"asset_mf_{item.get('folio')}",
+            "name": f"{clean_scheme} (Folio: {item.get('folio')})",
+            "type": "Mutual Funds",
+            "currency": item.get("currency", "INR"),
+            "value": item.get("marketValue", 0.0),
+            "hideFromDashboard": False
+        }, user_id=user_id)
+
+    # Assets
+    for asset in result.get("assets", []):
+        save_asset({
+            "id": f"asset_{re.sub(r'[^a-zA-Z0-9]', '_', asset.get('name', 'asset')).lower()}",
+            "name": asset.get("name"),
+            "type": asset.get("type", "Other"),
+            "currency": asset.get("currency", "USD"),
+            "value": asset.get("value", 0.0),
+            "hideFromDashboard": asset.get("hideFromDashboard", False)
+        }, user_id=user_id)
+
+    if result.get("isFixedDepositSummary"):
+        save_asset({
+            "id": "asset_hdfc_fixed_deposits_total",
+            "name": f"HDFC Fixed Deposits ({result.get('fdCount', 20)} FDs)",
+            "type": "Fixed Deposit (FD)",
+            "currency": result.get("currency", "INR"),
+            "value": result.get("principalAmount", 1393816.12),
+            "hideFromDashboard": False
+        }, user_id=user_id)
+
+    # Transactions
+    for tx in result.get("transactions", []):
+        res = save_transaction(tx, user_id=user_id)
+        if not (isinstance(res, dict) and res.get("duplicate")):
+            extracted_count += 1
+
+    # Balances
+    meta = result.get("metadata") or {}
+    ending_balance = meta.get("endingBalance") if meta.get("endingBalance") is not None else result.get("endingBalance")
+    acct_key = meta.get("accountName") or result.get("accountName") or "Bank Account"
+
+    if ending_balance is not None and ending_balance > 0:
+        current_settings = get_state(user_id).get("settings") or {}
+        current_balances = current_settings.get("accountBalances") or {}
+        current_balances[acct_key] = ending_balance
+        total_cash = sum(float(b or 0) for b in current_balances.values())
+
+        update_preferences({
+            "accountBalances": current_balances,
+            "assets": total_cash,
+            "netWorthConfigured": True
+        }, user_id=user_id)
+
+        if "credit card" not in acct_key.lower():
+            asset_id = f"asset_{re.sub(r'[^a-zA-Z0-9]', '_', acct_key).lower()}"
+            save_asset({
+                "id": asset_id,
+                "name": acct_key,
+                "type": "Cash / Bank Account",
+                "value": ending_balance,
+                "hideFromDashboard": False
+            }, user_id=user_id)
+
+    return extracted_count
 
 # 4.6 POST /api/documents (Multipart upload)
 @app.post("/api/documents")
 async def api_upload_documents(
+    request: Request,
     files: List[UploadFile] = File(...),
     password: Optional[str] = Form(None),
     source: Optional[str] = Form("upload")
 ):
     try:
+        user = get_current_user(request)
+        user_id = user["user_id"]
         if not files:
             raise HTTPException(status_code=400, detail="No files provided")
 
@@ -258,70 +439,24 @@ async def api_upload_documents(
 
             # Parse PDF
             if (file.content_type == "application/pdf") or (file.filename and file.filename.lower().endswith(".pdf")):
-                pdf_res = parse_pdf_bank_statement(file_bytes, {"password": password or "30031981"})
-
-                if pdf_res.get("isMutualFundCAS") and pdf_res.get("folios"):
-                    for item in pdf_res["folios"]:
-                        clean_scheme = re.sub(r'^[A-Z0-9]+-', '', item.get("scheme", "")).split('- ISIN')[0].strip() or "Mutual Fund"
-                        save_asset({
-                            "id": f"asset_mf_{item.get('folio')}",
-                            "name": f"{clean_scheme} (Folio: {item.get('folio')})",
-                            "type": "Mutual Funds",
-                            "currency": item.get("currency", "INR"),
-                            "value": item.get("marketValue", 0.0),
-                            "hideFromDashboard": False
-                        })
-
-                if pdf_res.get("isFixedDepositSummary"):
-                    save_asset({
-                        "id": "asset_hdfc_fixed_deposits_total",
-                        "name": f"HDFC Fixed Deposits ({pdf_res.get('fdCount', 20)} FDs)",
-                        "type": "Fixed Deposit (FD)",
-                        "currency": pdf_res.get("currency", "INR"),
-                        "value": pdf_res.get("principalAmount", 1393816.12),
-                        "hideFromDashboard": False
-                    })
-
-                if pdf_res.get("transactions"):
-                    for tx in pdf_res["transactions"]:
-                        save_transaction(tx)
-                        extracted_count += 1
-
-                if pdf_res.get("endingBalance") is not None and pdf_res["endingBalance"] > 0:
-                    current_settings = get_state().get("settings") or {}
-                    current_balances = current_settings.get("accountBalances") or {}
-                    acct_key = pdf_res.get("accountName") or "Bank Account"
-                    current_balances[acct_key] = pdf_res["endingBalance"]
-                    total_cash = sum(float(b or 0) for b in current_balances.values())
-
-                    update_preferences({
-                        "accountBalances": current_balances,
-                        "assets": total_cash,
-                        "netWorthConfigured": True
-                    })
-
-                    if "credit card" not in acct_key.lower():
-                        asset_id = f"asset_{re.sub(r'[^a-zA-Z0-9]', '_', acct_key).lower()}"
-                        save_asset({
-                            "id": asset_id,
-                            "name": acct_key,
-                            "type": "Cash / Bank Account",
-                            "value": pdf_res["endingBalance"],
-                            "hideFromDashboard": False
-                        })
-
-                status = "processed"
+                # 1. Delegate to incorg extraction service first
+                incorg_res = extract_document_via_incorg(file_bytes, file.filename or "uploaded_file", doc_type="bank_statement", password=password)
+                if incorg_res and incorg_res.get("success") and (incorg_res.get("transactions") or incorg_res.get("assets") or incorg_res.get("mutual_fund_folios")):
+                    extracted_count += ingest_parsed_results(incorg_res, user_id)
+                    status = "processed"
+                else:
+                    # 2. Resilient local fallback parser
+                    pdf_res = parse_pdf_bank_statement(file_bytes, {"password": password or "30031981"})
+                    extracted_count += ingest_parsed_results(pdf_res, user_id)
+                    status = "processed"
 
             elif (file.content_type == "text/csv") or (file.filename and file.filename.lower().endswith(".csv")):
                 csv_text = file_bytes.decode("utf-8", errors="ignore")
                 csv_res = parse_csv_bank_statement(csv_text, file.filename or "")
-                if csv_res.get("transactions"):
-                    for tx in csv_res["transactions"]:
-                        save_transaction(tx)
-                        extracted_count += 1
+                extracted_count += ingest_parsed_results(csv_res, user_id)
                 status = "processed"
 
-            deduplicate_transactions_in_db()
+            deduplicate_transactions_in_db(user_id=user_id)
 
             doc_record = {
                 "id": file_id,
@@ -333,7 +468,7 @@ async def api_upload_documents(
                 "source": source or "upload",
                 "createdAt": datetime.utcnow().isoformat() + "Z"
             }
-            saved = save_document_record(doc_record)
+            saved = save_document_record(doc_record, user_id=user_id)
             saved_docs.append(saved)
 
         return {"success": True, "documents": saved_docs, "extractedTransactions": extracted_count}
@@ -342,13 +477,68 @@ async def api_upload_documents(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.delete("/api/documents/{doc_id}")
-def api_delete_document(doc_id: str):
+# POST /api/documents/reprocess (Reprocess stored documents for current user)
+@app.post("/api/documents/reprocess")
+async def api_reprocess_documents(request: Request):
     try:
-        deleted = delete_document_record(doc_id)
+        user = get_current_user(request)
+        user_id = user["user_id"]
+        state = get_state(user_id)
+        docs = state.get("documents") or []
+
+        reprocessed_count = 0
+        total_extracted = 0
+
+        for doc in docs:
+            object_key = doc.get("objectKey")
+            if not object_key:
+                continue
+            file_path = STORAGE_BUCKET_DIR / object_key
+            if not file_path.exists():
+                continue
+
+            with open(file_path, "rb") as f:
+                file_bytes = f.read()
+
+            filename = doc.get("filename") or "document.pdf"
+            if filename.lower().endswith(".pdf") or doc.get("mimeType") == "application/pdf":
+                # Try incorg first
+                incorg_res = extract_document_via_incorg(file_bytes, filename, doc_type="bank_statement")
+                if incorg_res and incorg_res.get("success") and (incorg_res.get("transactions") or incorg_res.get("assets") or incorg_res.get("mutual_fund_folios")):
+                    cnt = ingest_parsed_results(incorg_res, user_id)
+                    total_extracted += cnt
+                else:
+                    pdf_res = parse_pdf_bank_statement(file_bytes, {"password": "30031981"})
+                    cnt = ingest_parsed_results(pdf_res, user_id)
+                    total_extracted += cnt
+                reprocessed_count += 1
+            elif filename.lower().endswith(".csv") or doc.get("mimeType") == "text/csv":
+                csv_text = file_bytes.decode("utf-8", errors="ignore")
+                csv_res = parse_csv_bank_statement(csv_text, filename)
+                cnt = ingest_parsed_results(csv_res, user_id)
+                total_extracted += cnt
+                reprocessed_count += 1
+
+        deduplicate_transactions_in_db(user_id=user_id)
+        return {
+            "success": True,
+            "reprocessedDocuments": reprocessed_count,
+            "extractedTransactions": total_extracted,
+            "state": get_state(user_id)
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/api/documents/{doc_id}")
+def api_delete_document(doc_id: str, request: Request):
+    try:
+        user = get_current_user(request)
+        deleted = delete_document_record(doc_id, user["user_id"])
         if not deleted:
             raise HTTPException(status_code=404, detail="Document not found")
-        duplicates_purged = deduplicate_transactions_in_db()
+        duplicates_purged = deduplicate_transactions_in_db(user["user_id"])
         return {"success": True, "deletedId": doc_id, "duplicatesPurged": duplicates_purged}
     except HTTPException:
         raise
@@ -359,10 +549,11 @@ def api_delete_document(doc_id: str):
 @app.delete("/api/state")
 async def api_wipe_state(request: Request):
     try:
+        user = get_current_user(request)
         body = await request.json()
         if body.get("confirmation") != "DELETE ALL LEDGERLY DATA":
             raise HTTPException(status_code=400, detail='Invalid confirmation payload. Exact string "DELETE ALL LEDGERLY DATA" is required.')
-        wiped_state = wipe_all_data()
+        wiped_state = wipe_all_data(user["user_id"])
         return {
             "success": True,
             "message": "All Ledgerly data has been completely deleted.",
@@ -375,18 +566,23 @@ async def api_wipe_state(request: Request):
 
 # 17.1 GET /api/drive-sync
 @app.get("/api/drive-sync")
-def api_get_drive_sync():
+def api_get_drive_sync(request: Request):
     try:
-        state = get_state()
+        user = get_current_user(request)
+        user_id = user["user_id"]
+        state = get_state(user_id)
         settings = state.get("settings") or {}
         sync_info = settings.get("driveSyncInfo") or {}
         processed_file_ids = settings.get("processedFileIds") or []
         drive_reset_at = settings.get("driveResetAt")
 
+        default_folder_id = "1MW88z2DRiIjgM-mDvGl-x4k576SAnZNq" if user_id == DEFAULT_USER_ID else ""
+        default_folder_url = f"https://drive.google.com/drive/folders/{default_folder_id}" if default_folder_id else ""
+
         return {
             "folderName": sync_info.get("folderName", "Ledgerly Financial Inbox"),
-            "folderId": sync_info.get("folderId", "folder-ledgerly-inbox-12345"),
-            "folderUrl": sync_info.get("folderUrl", "https://drive.google.com/drive/folders/ledgerly-inbox"),
+            "folderId": sync_info.get("folderId") or default_folder_id,
+            "folderUrl": sync_info.get("folderUrl") or default_folder_url,
             "schedule": sync_info.get("schedule", {"time": "08:00", "timezone": "CDT", "cadence": "daily"}),
             "lastSyncedAt": sync_info.get("lastSyncedAt"),
             "status": sync_info.get("status", "idle"),
@@ -401,11 +597,13 @@ def api_get_drive_sync():
 @app.post("/api/drive-sync")
 async def api_post_drive_sync(request: Request):
     try:
+        user = get_current_user(request)
+        user_id = user["user_id"]
         body = await request.json()
         transactions = body.get("transactions") or []
         files = body.get("files") or []
 
-        state = get_state()
+        state = get_state(user_id)
         settings = state.get("settings") or {}
         drive_reset_at = settings.get("driveResetAt")
         drive_reset_ms = int(datetime.fromisoformat(drive_reset_at.replace("Z", "+00:00")).timestamp() * 1000) if drive_reset_at else 0
@@ -435,13 +633,12 @@ async def api_post_drive_sync(request: Request):
                 "tags": list(set(list(tx.get("tags") or []) + ["Drive import"])),
                 "account": tx.get("account") or "Drive import"
             }
-            res_tx = save_transaction(tx_payload)
+            res_tx = save_transaction(tx_payload, user_id=user_id)
             if res_tx.get("duplicate"):
                 duplicate_count += 1
             else:
                 imported_count += 1
 
-        import base64
         for f in files:
             if not f.get("fileId"):
                 continue
@@ -480,7 +677,7 @@ async def api_post_drive_sync(request: Request):
                 "status": status,
                 "source": "google-drive",
                 "createdAt": datetime.utcnow().isoformat() + "Z"
-            })
+            }, user_id=user_id)
             processed_file_ids.add(f["fileId"])
             files_stored_count += 1
 
@@ -500,7 +697,7 @@ async def api_post_drive_sync(request: Request):
         update_preferences({
             "driveSyncInfo": updated_sync_info,
             "processedFileIds": list(processed_file_ids)[-5000:]
-        })
+        }, user_id=user_id)
 
         return {
             "status": "partial" if errors else "complete",
@@ -518,14 +715,15 @@ async def api_post_drive_sync(request: Request):
 @app.post("/api/chat")
 async def api_chat(request: Request):
     try:
+        user = get_current_user(request)
         body = await request.json()
         message = body.get("message", "").strip()
         if not message:
             raise HTTPException(status_code=400, detail="Message query is required")
 
-        state = get_state()
+        state = get_state(user["user_id"])
         transactions = state.get("transactions") or []
-        assets = get_assets()
+        assets = get_assets(user["user_id"])
         query_lower = message.lower()
 
         total_count = len(transactions)

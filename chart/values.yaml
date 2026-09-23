@@ -81,6 +81,7 @@ readinessProbe:
 env:
   ENVIRONMENT: "production"
   PORT: "3002"
+  INCORG_URL: "http://intelligent-content-organizer.incorg.svc.cluster.local:7860"
 
 nodeSelector: {}
 tolerations: []

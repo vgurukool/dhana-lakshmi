@@ -28,6 +28,37 @@ keycloak.init({
   redirectUri: window.location.origin + '/'
 }).then((authenticated) => {
   if (authenticated) {
+    // Intercept window.fetch to automatically attach Keycloak Bearer token and refresh if near expiry
+    const originalFetch = window.fetch;
+    window.fetch = async (input, init = {}) => {
+      const url = typeof input === 'string' ? input : (input?.url || '');
+      if (url.startsWith('/api') || url.includes('/api/')) {
+        try {
+          if (keycloak && keycloak.token) {
+            await keycloak.updateToken(30);
+          }
+        } catch (e) {
+          console.warn('Silent Keycloak token refresh failed:', e);
+        }
+
+        let headers;
+        if (init && init.headers) {
+          headers = new Headers(init.headers);
+        } else if (typeof input === 'object' && input.headers) {
+          headers = new Headers(input.headers);
+        } else {
+          headers = new Headers();
+        }
+
+        if (keycloak && keycloak.token && !headers.has('Authorization')) {
+          headers.set('Authorization', `Bearer ${keycloak.token}`);
+        }
+
+        return originalFetch(input, { ...init, headers });
+      }
+      return originalFetch(input, init);
+    };
+
     root.render(
       <React.StrictMode>
         <App keycloak={keycloak} />

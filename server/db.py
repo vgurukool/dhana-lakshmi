@@ -18,6 +18,7 @@ STORAGE_BUCKET_DIR.mkdir(parents=True, exist_ok=True)
 (STORAGE_BUCKET_DIR / "drive-inbox").mkdir(parents=True, exist_ok=True)
 
 DB_PATH = DATA_DIR / "ledgerly.db"
+DEFAULT_USER_ID = "66362f41-63af-4191-aeac-e9e7f362d946"
 
 def get_db():
     conn = sqlite3.connect(DB_PATH)
@@ -63,6 +64,14 @@ def init_db():
               updatedAt TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS user_settings (
+              userId TEXT NOT NULL,
+              key TEXT NOT NULL,
+              value TEXT NOT NULL,
+              updatedAt TEXT NOT NULL,
+              PRIMARY KEY (userId, key)
+            );
+
             CREATE TABLE IF NOT EXISTS documents (
               id TEXT PRIMARY KEY,
               filename TEXT NOT NULL,
@@ -74,7 +83,6 @@ def init_db():
               createdAt TEXT NOT NULL
             );
 
-            
             CREATE TABLE IF NOT EXISTS financial_accounts (
               id TEXT PRIMARY KEY,
               category TEXT NOT NULL,
@@ -127,11 +135,35 @@ def init_db():
             conn.execute("ALTER TABLE transactions ADD COLUMN incomeType TEXT")
         except Exception:
             pass
-    conn.close()
-    init_settings_if_missing()
-    seed_initial_accounts_if_empty()
 
-def init_settings_if_missing():
+        # Multi-tenant migration: add userId column to all data tables
+        for table in ['transactions', 'financial_accounts', 'assets', 'documents', 'rules', 'tags']:
+            try:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN userId TEXT NOT NULL DEFAULT '{DEFAULT_USER_ID}'")
+            except Exception:
+                pass
+
+        # Migrate existing settings into user_settings for Ayush (DEFAULT_USER_ID)
+        try:
+            conn.execute("""
+                INSERT OR IGNORE INTO user_settings (userId, key, value, updatedAt)
+                SELECT ?, key, value, updatedAt FROM settings
+            """, (DEFAULT_USER_ID,))
+        except Exception as e:
+            print(f"[DB INIT] user_settings migration notice: {e}")
+
+        # Ensure composite uniqueness for transactions fingerprint per user
+        try:
+            conn.execute("UPDATE transactions SET fingerprint = ? || '|' || fingerprint WHERE userId = ? AND fingerprint NOT LIKE ? || '|%'",
+                         (DEFAULT_USER_ID, DEFAULT_USER_ID, DEFAULT_USER_ID))
+        except Exception:
+            pass
+
+    conn.close()
+    init_user_settings_if_missing(DEFAULT_USER_ID)
+    seed_initial_accounts_if_empty(DEFAULT_USER_ID)
+
+def init_user_settings_if_missing(user_id=DEFAULT_USER_ID):
     conn = get_db()
     default_categories = [
         'Housing', 'Groceries', 'Shopping', 'Dining', 'Transportation',
@@ -142,10 +174,20 @@ def init_settings_if_missing():
 
     def set_setting_if_absent(k, v):
         cur = conn.cursor()
-        cur.execute("SELECT value FROM settings WHERE key = ?", (k,))
+        cur.execute("SELECT value FROM user_settings WHERE userId = ? AND key = ?", (user_id, k))
         if not cur.fetchone():
-            cur.execute("INSERT INTO settings (key, value, updatedAt) VALUES (?, ?, ?)",
-                        (k, json.dumps(v), datetime.utcnow().isoformat() + "Z"))
+            cur.execute("INSERT INTO user_settings (userId, key, value, updatedAt) VALUES (?, ?, ?, ?)",
+                        (user_id, k, json.dumps(v), datetime.utcnow().isoformat() + "Z"))
+
+    drive_sync_default = {
+        'folderName': 'Ledgerly Financial Inbox',
+        'folderId': '1MW88z2DRiIjgM-mDvGl-x4k576SAnZNq' if user_id == DEFAULT_USER_ID else '',
+        'folderUrl': 'https://drive.google.com/drive/folders/1MW88z2DRiIjgM-mDvGl-x4k576SAnZNq' if user_id == DEFAULT_USER_ID else '',
+        'lastSyncedAt': None,
+        'schedule': {'time': '08:00', 'timezone': 'CDT', 'cadence': 'daily'},
+        'status': 'idle',
+        'lastCounts': {'imported': 0, 'duplicate': 0, 'filesStored': 0, 'review': 0, 'errors': 0}
+    }
 
     with conn:
         set_setting_if_absent('categories', default_categories)
@@ -159,20 +201,15 @@ def init_settings_if_missing():
         set_setting_if_absent('assets', 0)
         set_setting_if_absent('liabilities', 0)
         set_setting_if_absent('netWorthConfigured', False)
-        set_setting_if_absent('driveSyncInfo', {
-            'folderName': 'Ledgerly Financial Inbox',
-            'folderId': 'folder-ledgerly-inbox-12345',
-            'folderUrl': 'https://drive.google.com/drive/folders/ledgerly-inbox',
-            'lastSyncedAt': None,
-            'schedule': {'time': '08:00', 'timezone': 'CDT', 'cadence': 'daily'},
-            'status': 'idle',
-            'lastCounts': {'imported': 0, 'duplicate': 0, 'filesStored': 0, 'review': 0, 'errors': 0}
-        })
+        set_setting_if_absent('driveSyncInfo', drive_sync_default)
         set_setting_if_absent('processedFileIds', [])
         set_setting_if_absent('driveResetAt', None)
         set_setting_if_absent('freshStart', True)
 
     conn.close()
+
+def init_settings_if_missing():
+    init_user_settings_if_missing(DEFAULT_USER_ID)
 
 
 
@@ -371,11 +408,16 @@ def infer_income_source_and_type(category, merchant):
 
     return ("Salary & Wages", "active")
 
-def get_state():
+def get_state(user_id=DEFAULT_USER_ID):
     conn = get_db()
     cur = conn.cursor()
 
-    cur.execute("SELECT * FROM transactions ORDER BY date DESC, createdAt DESC LIMIT 5000")
+    # Ensure user settings exist
+    cur.execute("SELECT count(*) FROM user_settings WHERE userId = ?", (user_id,))
+    if cur.fetchone()[0] == 0:
+        init_user_settings_if_missing(user_id)
+
+    cur.execute("SELECT * FROM transactions WHERE userId = ? ORDER BY date DESC, createdAt DESC LIMIT 5000", (user_id,))
     tx_rows = [dict(r) for r in cur.fetchall()]
     parsed_transactions = []
     for t in tx_rows:
@@ -411,14 +453,17 @@ def get_state():
             "incomeType": inc_type
         })
 
-    cur.execute("SELECT * FROM tags ORDER BY name ASC")
+    cur.execute("SELECT * FROM tags WHERE userId = ? ORDER BY name ASC", (user_id,))
     tags_rows = [dict(r) for r in cur.fetchall()]
+    if not tags_rows:
+        cur.execute("SELECT * FROM tags WHERE userId = ? ORDER BY name ASC", (DEFAULT_USER_ID,))
+        tags_rows = [dict(r) for r in cur.fetchall()]
 
-    cur.execute("SELECT * FROM rules ORDER BY createdAt DESC")
+    cur.execute("SELECT * FROM rules WHERE userId = ? ORDER BY createdAt DESC", (user_id,))
     rules_rows = [dict(r) for r in cur.fetchall()]
     rules = [{**r, "enabled": bool(r.get("enabled", 1))} for r in rules_rows]
 
-    cur.execute("SELECT * FROM settings")
+    cur.execute("SELECT * FROM user_settings WHERE userId = ?", (user_id,))
     settings_rows = cur.fetchall()
     settings = {}
     for r in settings_rows:
@@ -428,11 +473,11 @@ def get_state():
         except Exception:
             settings[r["key"]] = val
 
-    cur.execute("SELECT * FROM documents ORDER BY createdAt DESC LIMIT 100")
+    cur.execute("SELECT * FROM documents WHERE userId = ? ORDER BY createdAt DESC LIMIT 100", (user_id,))
     documents = [dict(r) for r in cur.fetchall()]
 
     conn.close()
-    assets_list = get_assets()
+    assets_list = get_assets(user_id)
 
     return {
         "transactions": parsedTransactions_to_dict(parsed_transactions),
@@ -441,33 +486,33 @@ def get_state():
         "settings": settings,
         "documents": documents,
         "assetsList": assets_list,
-        "accountsList": get_financial_accounts()
+        "accountsList": get_financial_accounts(user_id)
     }
 
 def parsedTransactions_to_dict(txs):
     return txs
 
-def get_assets():
+def get_assets(user_id=DEFAULT_USER_ID):
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM assets ORDER BY createdAt DESC")
+    cur.execute("SELECT * FROM assets WHERE userId = ? ORDER BY createdAt DESC", (user_id,))
     rows = [dict(r) for r in cur.fetchall()]
     conn.close()
     return [{**r, "hideFromDashboard": bool(r.get("hideFromDashboard"))} for r in rows]
 
-def sync_assets_setting():
+def sync_assets_setting(user_id=DEFAULT_USER_ID):
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT SUM(value) as total FROM assets WHERE hideFromDashboard = 0")
+    cur.execute("SELECT SUM(value) as total FROM assets WHERE userId = ? AND hideFromDashboard = 0", (user_id,))
     row = cur.fetchone()
     visible_sum = float(row["total"]) if row and row["total"] is not None else 0.0
     conn.close()
     update_preferences({
         "assets": visible_sum,
         "netWorthConfigured": True
-    })
+    }, user_id=user_id)
 
-def save_asset(asset):
+def save_asset(asset, user_id=DEFAULT_USER_ID):
     conn = get_db()
     id_val = asset.get("id") or f"asset_{int(datetime.now().timestamp()*1000)}_{''.join(random.choices(string.ascii_lowercase + string.digits, k=6))}"
     name = str(asset.get("name") or "Untitled Asset").strip()
@@ -479,28 +524,28 @@ def save_asset(asset):
 
     with conn:
         conn.execute("""
-            INSERT INTO assets (id, name, type, currency, value, hideFromDashboard, createdAt)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO assets (id, name, type, currency, value, hideFromDashboard, createdAt, userId)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
               name = excluded.name,
               type = excluded.type,
               currency = excluded.currency,
               value = excluded.value,
               hideFromDashboard = excluded.hideFromDashboard
-        """, (id_val, name, atype, currency, value, hide, created_at))
+        """, (id_val, name, atype, currency, value, hide, created_at, user_id))
 
     cur = conn.cursor()
-    cur.execute("SELECT * FROM assets WHERE id = ?", (id_val,))
+    cur.execute("SELECT * FROM assets WHERE id = ? AND userId = ?", (id_val, user_id))
     row = dict(cur.fetchone())
     conn.close()
 
-    sync_assets_setting()
+    sync_assets_setting(user_id)
     return {**row, "hideFromDashboard": bool(row.get("hideFromDashboard"))}
 
-def patch_asset(id_val, updates):
+def patch_asset(id_val, updates, user_id=DEFAULT_USER_ID):
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM assets WHERE id = ?", (id_val,))
+    cur.execute("SELECT * FROM assets WHERE id = ? AND userId = ?", (id_val, user_id))
     existing = cur.fetchone()
     if not existing:
         conn.close()
@@ -514,23 +559,23 @@ def patch_asset(id_val, updates):
     new_hide = (1 if updates["hideFromDashboard"] else 0) if "hideFromDashboard" in updates else existing["hideFromDashboard"]
 
     with conn:
-        conn.execute("UPDATE assets SET name = ?, type = ?, currency = ?, value = ?, hideFromDashboard = ? WHERE id = ?",
-                     (new_name, new_type, new_curr, new_val, new_hide, id_val))
+        conn.execute("UPDATE assets SET name = ?, type = ?, currency = ?, value = ?, hideFromDashboard = ? WHERE id = ? AND userId = ?",
+                     (new_name, new_type, new_curr, new_val, new_hide, id_val, user_id))
 
-    cur.execute("SELECT * FROM assets WHERE id = ?", (id_val,))
+    cur.execute("SELECT * FROM assets WHERE id = ? AND userId = ?", (id_val, user_id))
     updated = dict(cur.fetchone())
     conn.close()
 
-    sync_assets_setting()
+    sync_assets_setting(user_id)
     return {**updated, "hideFromDashboard": bool(updated.get("hideFromDashboard"))}
 
-def delete_asset(id_val):
+def delete_asset(id_val, user_id=DEFAULT_USER_ID):
     conn = get_db()
     with conn:
-        res = conn.execute("DELETE FROM assets WHERE id = ?", (id_val,))
+        res = conn.execute("DELETE FROM assets WHERE id = ? AND userId = ?", (id_val, user_id))
         changes = res.rowcount
     conn.close()
-    sync_assets_setting()
+    sync_assets_setting(user_id)
     return changes > 0
 
 def evaluate_rule_match(merchant_text, when_text, operator="OR"):
@@ -547,13 +592,14 @@ def evaluate_rule_match(merchant_text, when_text, operator="OR"):
         terms = [t.strip().lower() for t in re.split(r',|OR', raw_when, flags=re.IGNORECASE) if t.strip()]
         return len(terms) > 0 and any(term in lower_merch for term in terms)
 
-def compute_fingerprint(date, merchant, amount, account):
+def compute_fingerprint(date, merchant, amount, account, user_id=DEFAULT_USER_ID):
     clean_merchant = (merchant or "").strip().lower()
     clean_account = (account or "").strip().lower()
     formatted_amount = f"{float(amount):.2f}"
-    return f"{date}|{clean_merchant}|{formatted_amount}|{clean_account}"
+    uid = user_id or DEFAULT_USER_ID
+    return f"{uid}|{date}|{clean_merchant}|{formatted_amount}|{clean_account}"
 
-def save_transaction(t):
+def save_transaction(t, user_id=DEFAULT_USER_ID):
     conn = get_db()
     id_val = t.get("id") or f"tx_{int(datetime.now().timestamp()*1000)}_{''.join(random.choices(string.ascii_lowercase + string.digits, k=9))}"
     date = str(t.get("date"))
@@ -569,10 +615,10 @@ def save_transaction(t):
     source = str(t.get("source") or "manual")
     created_at = t.get("createdAt") or datetime.utcnow().isoformat() + "Z"
 
-    fingerprint = compute_fingerprint(date, merchant, amount, account)
+    fingerprint = compute_fingerprint(date, merchant, amount, account, user_id)
 
     cur = conn.cursor()
-    cur.execute("SELECT id FROM transactions WHERE fingerprint = ?", (fingerprint,))
+    cur.execute("SELECT id FROM transactions WHERE fingerprint = ? AND userId = ?", (fingerprint, user_id))
     existing = cur.fetchone()
     if existing:
         conn.close()
@@ -581,7 +627,7 @@ def save_transaction(t):
     # Rules matching
     final_category = category
     final_tags = list(normalized_tags)
-    cur.execute("SELECT value FROM settings WHERE key = 'rules'")
+    cur.execute("SELECT value FROM user_settings WHERE userId = ? AND key = 'rules'", (user_id,))
     rules_row = cur.fetchone()
     if rules_row and rules_row["value"]:
         try:
@@ -611,14 +657,14 @@ def save_transaction(t):
 
     with conn:
         conn.execute("""
-            INSERT INTO transactions (id, date, merchant, category, amount, type, account, tags, receipt, source, fingerprint, createdAt, incomeSource, incomeType)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (id_val, date, merchant, final_category, amount, ttype, account, json.dumps(final_tags), receipt, source, fingerprint, created_at, income_src, income_typ))
+            INSERT INTO transactions (id, date, merchant, category, amount, type, account, tags, receipt, source, fingerprint, createdAt, incomeSource, incomeType, userId)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (id_val, date, merchant, final_category, amount, ttype, account, json.dumps(final_tags), receipt, source, fingerprint, created_at, income_src, income_typ, user_id))
 
         for tag in final_tags:
-            conn.execute("INSERT OR IGNORE INTO tags (name, createdAt) VALUES (?, ?)", (tag, datetime.utcnow().isoformat() + "Z"))
+            conn.execute("INSERT OR IGNORE INTO tags (name, createdAt, userId) VALUES (?, ?, ?)", (tag, datetime.utcnow().isoformat() + "Z", user_id))
 
-    cur.execute("SELECT * FROM transactions WHERE id = ?", (id_val,))
+    cur.execute("SELECT * FROM transactions WHERE id = ? AND userId = ?", (id_val, user_id))
     row = dict(cur.fetchone())
     conn.close()
 
@@ -636,10 +682,10 @@ def save_transaction(t):
         }
     }
 
-def patch_transaction(id_val, updates):
+def patch_transaction(id_val, updates, user_id=DEFAULT_USER_ID):
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM transactions WHERE id = ?", (id_val,))
+    cur.execute("SELECT * FROM transactions WHERE id = ? AND userId = ?", (id_val, user_id))
     row = cur.fetchone()
     if not row:
         conn.close()
@@ -676,12 +722,12 @@ def patch_transaction(id_val, updates):
         new_inc_type = str(updates["incomeType"]).strip().lower()
 
     with conn:
-        conn.execute("UPDATE transactions SET category = ?, tags = ?, ashtaLakshmi = ?, primaryExpenseCategory = ?, incomeSource = ?, incomeType = ? WHERE id = ?",
-                     (new_category, json.dumps(new_tags), new_ashta, new_primary, new_inc_source, new_inc_type, id_val))
+        conn.execute("UPDATE transactions SET category = ?, tags = ?, ashtaLakshmi = ?, primaryExpenseCategory = ?, incomeSource = ?, incomeType = ? WHERE id = ? AND userId = ?",
+                     (new_category, json.dumps(new_tags), new_ashta, new_primary, new_inc_source, new_inc_type, id_val, user_id))
         for tag in new_tags:
-            conn.execute("INSERT OR IGNORE INTO tags (name, createdAt) VALUES (?, ?)", (tag, datetime.utcnow().isoformat() + "Z"))
+            conn.execute("INSERT OR IGNORE INTO tags (name, createdAt, userId) VALUES (?, ?, ?)", (tag, datetime.utcnow().isoformat() + "Z", user_id))
 
-    cur.execute("SELECT * FROM transactions WHERE id = ?", (id_val,))
+    cur.execute("SELECT * FROM transactions WHERE id = ? AND userId = ?", (id_val, user_id))
     updated = dict(cur.fetchone())
     conn.close()
 
@@ -695,18 +741,18 @@ def patch_transaction(id_val, updates):
         "incomeType": updated.get("incomeType") or infer_income_source_and_type(updated.get("category"), updated.get("merchant"))[1]
     }
 
-def delete_transaction(id_val):
+def delete_transaction(id_val, user_id=DEFAULT_USER_ID):
     conn = get_db()
     with conn:
-        res = conn.execute("DELETE FROM transactions WHERE id = ?", (id_val,))
+        res = conn.execute("DELETE FROM transactions WHERE id = ? AND userId = ?", (id_val, user_id))
         changes = res.rowcount
     conn.close()
     return changes > 0
 
-def apply_rules_to_all_transactions():
+def apply_rules_to_all_transactions(user_id=DEFAULT_USER_ID):
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT value FROM settings WHERE key = 'rules'")
+    cur.execute("SELECT value FROM user_settings WHERE userId = ? AND key = 'rules'", (user_id,))
     row = cur.fetchone()
     if not row or not row["value"]:
         conn.close()
@@ -722,7 +768,7 @@ def apply_rules_to_all_transactions():
         conn.close()
         return 0
 
-    cur.execute("SELECT id, merchant, category, tags FROM transactions")
+    cur.execute("SELECT id, merchant, category, tags FROM transactions WHERE userId = ?", (user_id,))
     txs = [dict(r) for r in cur.fetchall()]
     updated_count = 0
 
@@ -741,16 +787,16 @@ def apply_rules_to_all_transactions():
                         changed = True
 
             if changed:
-                conn.execute("UPDATE transactions SET category = ? WHERE id = ?", (new_cat, tx["id"]))
+                conn.execute("UPDATE transactions SET category = ? WHERE id = ? AND userId = ?", (new_cat, tx["id"], user_id))
                 updated_count += 1
 
     conn.close()
     return updated_count
 
-def deduplicate_transactions_in_db():
+def deduplicate_transactions_in_db(user_id=DEFAULT_USER_ID):
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT id, fingerprint, createdAt FROM transactions ORDER BY createdAt ASC")
+    cur.execute("SELECT id, fingerprint, createdAt FROM transactions WHERE userId = ? ORDER BY createdAt ASC", (user_id,))
     rows = [dict(r) for r in cur.fetchall()]
     seen = set()
     deleted_count = 0
@@ -759,7 +805,7 @@ def deduplicate_transactions_in_db():
         for r in rows:
             fp = r["fingerprint"]
             if fp in seen:
-                conn.execute("DELETE FROM transactions WHERE id = ?", (r["id"],))
+                conn.execute("DELETE FROM transactions WHERE id = ? AND userId = ?", (r["id"], user_id))
                 deleted_count += 1
             else:
                 seen.add(fp)
@@ -767,7 +813,7 @@ def deduplicate_transactions_in_db():
     # Fuzzy Deduplication (PDF vs CSV)
     def clean_name(m):
         m_str = str(m or '').lower()
-        m_str = re.sub(r'(houston|tx|bellevue|wa|card|auto|pay|mobile|www|com|inc|llc)', '', m_str)
+        m_str = re.sub(r' (houston|tx|bellevue|wa|card|auto|pay|mobile|www|com|inc|llc) ', '', m_str)
         return re.sub(r'[^a-z0-9]', '', m_str)
 
     def is_similar_merchant(m1, m2):
@@ -777,7 +823,7 @@ def deduplicate_transactions_in_db():
             return False
         return (c1 in c2) or (c2 in c1) or (c1 == c2)
 
-    cur.execute("SELECT * FROM transactions ORDER BY date DESC")
+    cur.execute("SELECT * FROM transactions WHERE userId = ? ORDER BY date DESC", (user_id,))
     txs = [dict(r) for r in cur.fetchall()]
     duplicates_to_delete = set()
 
@@ -802,46 +848,46 @@ def deduplicate_transactions_in_db():
             if same_account and same_amount and days_diff <= 3:
                 if is_similar_merchant(t1.get("merchant"), t2.get("merchant")):
                     if t1.get("category") == "Needs review" and t2.get("category") != "Needs review":
-                        conn.execute("UPDATE transactions SET category = ? WHERE id = ?", (t2["category"], t1["id"]))
+                        conn.execute("UPDATE transactions SET category = ? WHERE id = ? AND userId = ?", (t2["category"], t1["id"], user_id))
                     duplicates_to_delete.add(t2["id"])
 
     if duplicates_to_delete:
         with conn:
             for did in duplicates_to_delete:
-                res = conn.execute("DELETE FROM transactions WHERE id = ?", (did,))
+                res = conn.execute("DELETE FROM transactions WHERE id = ? AND userId = ?", (did, user_id))
                 deleted_count += res.rowcount
 
     conn.close()
     return deleted_count
 
-def update_preferences(prefs):
+def update_preferences(prefs, user_id=DEFAULT_USER_ID):
     conn = get_db()
     now_iso = datetime.utcnow().isoformat() + "Z"
     with conn:
         for k, v in prefs.items():
             if v is not None:
-                conn.execute("INSERT OR REPLACE INTO settings (key, value, updatedAt) VALUES (?, ?, ?)",
-                             (k, json.dumps(v), now_iso))
+                conn.execute("INSERT OR REPLACE INTO user_settings (userId, key, value, updatedAt) VALUES (?, ?, ?, ?)",
+                             (user_id, k, json.dumps(v), now_iso))
     conn.close()
-    return get_state()["settings"]
+    return get_state(user_id)["settings"]
 
-def save_document_record(doc):
+def save_document_record(doc, user_id=DEFAULT_USER_ID):
     conn = get_db()
     with conn:
         conn.execute("""
-            INSERT INTO documents (id, filename, mimeType, size, objectKey, status, source, createdAt)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (doc["id"], doc["filename"], doc["mimeType"], doc["size"], doc["objectKey"], doc["status"], doc["source"], doc["createdAt"]))
+            INSERT INTO documents (id, filename, mimeType, size, objectKey, status, source, createdAt, userId)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (doc["id"], doc["filename"], doc["mimeType"], doc["size"], doc["objectKey"], doc["status"], doc["source"], doc["createdAt"], user_id))
     cur = conn.cursor()
-    cur.execute("SELECT * FROM documents WHERE id = ?", (doc["id"],))
+    cur.execute("SELECT * FROM documents WHERE id = ? AND userId = ?", (doc["id"], user_id))
     res = dict(cur.fetchone())
     conn.close()
     return res
 
-def delete_document_record(doc_id):
+def delete_document_record(doc_id, user_id=DEFAULT_USER_ID):
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM documents WHERE id = ?", (doc_id,))
+    cur.execute("SELECT * FROM documents WHERE id = ? AND userId = ?", (doc_id, user_id))
     row = cur.fetchone()
     if not row:
         conn.close()
@@ -857,9 +903,9 @@ def delete_document_record(doc_id):
                 pass
 
     with conn:
-        res = conn.execute("DELETE FROM documents WHERE id = ?", (doc_id,))
+        res = conn.execute("DELETE FROM documents WHERE id = ? AND userId = ?", (doc_id, user_id))
         changes = res.rowcount
-        conn.execute("DELETE FROM transactions WHERE source = 'document' OR source = 'google-drive' OR source = ?", (doc_id,))
+        conn.execute("DELETE FROM transactions WHERE (source = 'document' OR source = 'google-drive' OR source = ?) AND userId = ?", (doc_id, user_id))
 
     conn.close()
     return changes > 0
@@ -870,58 +916,50 @@ def store_r2_object(object_key, buffer_bytes):
     with open(full_path, "wb") as f:
         f.write(buffer_bytes)
 
-def wipe_all_data():
+def wipe_all_data(user_id=DEFAULT_USER_ID):
     conn = get_db()
     with conn:
-        conn.execute("DELETE FROM transactions")
-        conn.execute("DELETE FROM tags")
-        conn.execute("DELETE FROM rules")
-        conn.execute("DELETE FROM settings")
-        conn.execute("DELETE FROM documents")
+        conn.execute("DELETE FROM transactions WHERE userId = ?", (user_id,))
+        conn.execute("DELETE FROM tags WHERE userId = ?", (user_id,))
+        conn.execute("DELETE FROM rules WHERE userId = ?", (user_id,))
+        conn.execute("DELETE FROM user_settings WHERE userId = ?", (user_id,))
+        conn.execute("DELETE FROM documents WHERE userId = ?", (user_id,))
+        conn.execute("DELETE FROM financial_accounts WHERE userId = ?", (user_id,))
+        conn.execute("DELETE FROM assets WHERE userId = ?", (user_id,))
     conn.close()
 
-    import shutil
-    if STORAGE_BUCKET_DIR.exists():
-        for p in STORAGE_BUCKET_DIR.glob("*"):
-            if p.is_dir():
-                shutil.rmtree(p, ignore_errors=True)
-            else:
-                p.unlink(missing_ok=True)
-
-    (STORAGE_BUCKET_DIR / "uploads").mkdir(parents=True, exist_ok=True)
-    (STORAGE_BUCKET_DIR / "drive-inbox").mkdir(parents=True, exist_ok=True)
-
-    init_settings_if_missing()
-    seed_initial_accounts_if_empty()
+    init_user_settings_if_missing(user_id)
+    if user_id == DEFAULT_USER_ID:
+        seed_initial_accounts_if_empty(user_id)
 
     reset_iso = datetime.utcnow().isoformat() + "Z"
     update_preferences({
         "driveResetAt": reset_iso,
         "freshStart": True
-    })
+    }, user_id=user_id)
 
-    return get_state()
+    return get_state(user_id)
 
 
 # ================= FINANCIAL ACCOUNTS & RECURRING OBLIGATIONS =================
 
-def seed_initial_accounts_if_empty():
+def seed_initial_accounts_if_empty(user_id=DEFAULT_USER_ID):
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT count(*) FROM financial_accounts")
+    cur.execute("SELECT count(*) FROM financial_accounts WHERE userId = ?", (user_id,))
     if cur.fetchone()[0] == 0:
         now_str = datetime.utcnow().strftime("%Y-%m-%d")
         now_iso = datetime.utcnow().isoformat() + "Z"
         
         initial = [
-            ('acc_mortgage_1', 'mortgage', 'Primary Residence 30-Yr Fixed', 'Chase Home Lending', '4912', 385400.0, 4.125, 2485.0, 'monthly', 1, '2026-10-01', '2026-09-01', 1, '2052-04-01', 0.0, 'P&I + Escrow (property taxes & hazard insurance). Semi-annual escrow review in October.', 'active', now_iso, now_iso),
-            ('acc_auto_1', 'auto_loan', 'Model Y Long Range Auto Loan', 'Tesla Finance', '8103', 21800.0, 3.99, 540.0, 'monthly', 15, '2026-09-15', '2026-08-15', 1, '2028-06-15', 0.0, 'Low APR 60-mo term. Autopay linked to Main Checking.', 'active', now_iso, now_iso),
-            ('acc_cc_1', 'credit_card', 'Chase Sapphire Reserve', 'JPMorgan Chase', '4920', 3450.0, 22.49, 150.0, 'monthly', 20, '2026-09-20', '2026-08-20', 1, '', 25000.0, 'Statement balance $3,450 (Credit limit $25k). Autopay full balance scheduled on 20th.', 'active', now_iso, now_iso),
-            ('acc_cc_2', 'credit_card', 'American Express Gold Card', 'American Express', '8104', 1820.0, 20.99, 1820.0, 'monthly', 25, '2026-09-25', '2026-08-25', 1, '', 15000.0, 'Dining & travel card. Autopay configured to pay full statement balance.', 'active', now_iso, now_iso),
-            ('acc_loan_1', 'personal_loan', 'Education Consolidation Loan', 'SoFi Lending Corp', '6720', 11500.0, 4.75, 285.0, 'monthly', 8, '2026-09-08', '2026-08-08', 1, '2027-11-01', 0.0, 'Fixed interest rate. 14 months remaining to full payoff.', 'active', now_iso, now_iso),
-            ('acc_ins_1', 'insurance', 'Comprehensive Homeowners Policy', 'State Farm', '3921', 0.0, 0.0, 1420.0, 'annual', 15, '2026-11-15', '2025-11-15', 1, '2026-11-15', 650000.0, 'Dwelling $650k, Personal property $350k, Liability $500k. Paid annually.', 'active', now_iso, now_iso),
-            ('acc_ins_2', 'insurance', 'Multi-Vehicle Full Coverage', 'GEICO Preferred', '4919', 0.0, 0.0, 175.0, 'monthly', 5, '2026-09-05', '2026-08-05', 1, '2027-02-01', 500000.0, '$500 deductible, collision + comprehensive + roadside assistance.', 'active', now_iso, now_iso),
-            ('acc_ins_3', 'insurance', '20-Yr Level Term Life Insurance', 'Lincoln Financial Group', '1029', 0.0, 0.0, 68.0, 'monthly', 12, '2026-09-12', '2026-08-12', 1, '2042-08-01', 1000000.0, '$1,000,000 death benefit for family protection. Level premium guaranteed.', 'active', now_iso, now_iso)
+            ('acc_mortgage_1', 'mortgage', 'Primary Residence 30-Yr Fixed', 'Chase Home Lending', '4912', 385400.0, 4.125, 2485.0, 'monthly', 1, '2026-10-01', '2026-09-01', 1, '2052-04-01', 0.0, 'P&I + Escrow (property taxes & hazard insurance). Semi-annual escrow review in October.', 'active', now_iso, now_iso, user_id),
+            ('acc_auto_1', 'auto_loan', 'Model Y Long Range Auto Loan', 'Tesla Finance', '8103', 21800.0, 3.99, 540.0, 'monthly', 15, '2026-09-15', '2026-08-15', 1, '2028-06-15', 0.0, 'Low APR 60-mo term. Autopay linked to Main Checking.', 'active', now_iso, now_iso, user_id),
+            ('acc_cc_1', 'credit_card', 'Chase Sapphire Reserve', 'JPMorgan Chase', '4920', 3450.0, 22.49, 150.0, 'monthly', 20, '2026-09-20', '2026-08-20', 1, '', 25000.0, 'Statement balance $3,450 (Credit limit $25k). Autopay full balance scheduled on 20th.', 'active', now_iso, now_iso, user_id),
+            ('acc_cc_2', 'credit_card', 'American Express Gold Card', 'American Express', '8104', 1820.0, 20.99, 1820.0, 'monthly', 25, '2026-09-25', '2026-08-25', 1, '', 15000.0, 'Dining & travel card. Autopay configured to pay full statement balance.', 'active', now_iso, now_iso, user_id),
+            ('acc_loan_1', 'personal_loan', 'Education Consolidation Loan', 'SoFi Lending Corp', '6720', 11500.0, 4.75, 285.0, 'monthly', 8, '2026-09-08', '2026-08-08', 1, '2027-11-01', 0.0, 'Fixed interest rate. 14 months remaining to full payoff.', 'active', now_iso, now_iso, user_id),
+            ('acc_ins_1', 'insurance', 'Comprehensive Homeowners Policy', 'State Farm', '3921', 0.0, 0.0, 1420.0, 'annual', 15, '2026-11-15', '2025-11-15', 1, '2026-11-15', 650000.0, 'Dwelling $650k, Personal property $350k, Liability $500k. Paid annually.', 'active', now_iso, now_iso, user_id),
+            ('acc_ins_2', 'insurance', 'Multi-Vehicle Full Coverage', 'GEICO Preferred', '4919', 0.0, 0.0, 175.0, 'monthly', 5, '2026-09-05', '2026-08-05', 1, '2027-02-01', 500000.0, '$500 deductible, collision + comprehensive + roadside assistance.', 'active', now_iso, now_iso, user_id),
+            ('acc_ins_3', 'insurance', '20-Yr Level Term Life Insurance', 'Lincoln Financial Group', '1029', 0.0, 0.0, 68.0, 'monthly', 12, '2026-09-12', '2026-08-12', 1, '2042-08-01', 1000000.0, '$1,000,000 death benefit for family protection. Level premium guaranteed.', 'active', now_iso, now_iso, user_id)
         ]
 
         with conn:
@@ -930,15 +968,15 @@ def seed_initial_accounts_if_empty():
                     INSERT INTO financial_accounts (
                       id, category, name, institution, accountNumberLast4, balance, interestRate,
                       paymentAmount, paymentFrequency, dueDay, nextDueDate, lastPaidDate, autoPay,
-                      maturityDate, coverageAmount, notes, status, createdAt, updatedAt
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                      maturityDate, coverageAmount, notes, status, createdAt, updatedAt, userId
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', acc)
     conn.close()
 
-def get_financial_accounts():
+def get_financial_accounts(user_id=DEFAULT_USER_ID):
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM financial_accounts ORDER BY nextDueDate ASC, dueDay ASC")
+    cur.execute("SELECT * FROM financial_accounts WHERE userId = ? ORDER BY nextDueDate ASC, dueDay ASC", (user_id,))
     rows = [dict(r) for r in cur.fetchall()]
     conn.close()
 
@@ -974,7 +1012,7 @@ def get_financial_accounts():
 
     return enriched
 
-def save_financial_account(data):
+def save_financial_account(data, user_id=DEFAULT_USER_ID):
     conn = get_db()
     acc_id = data.get("id") or f"acc_{int(datetime.utcnow().timestamp()*1000)}"
     cat = str(data.get("category") or "bank").strip()
@@ -1001,8 +1039,8 @@ def save_financial_account(data):
             INSERT INTO financial_accounts (
               id, category, name, institution, accountNumberLast4, balance, interestRate,
               paymentAmount, paymentFrequency, dueDay, nextDueDate, lastPaidDate, autoPay,
-              maturityDate, coverageAmount, notes, status, createdAt, updatedAt
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              maturityDate, coverageAmount, notes, status, createdAt, updatedAt, userId
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
               category = excluded.category,
               name = excluded.name,
@@ -1023,20 +1061,20 @@ def save_financial_account(data):
               updatedAt = excluded.updatedAt
         ''', (
             acc_id, cat, name, inst, last4, balance, rate, payment, freq, due_day,
-            next_due, last_paid, autopay, maturity, coverage, notes, status, created_at, now_iso
+            next_due, last_paid, autopay, maturity, coverage, notes, status, created_at, now_iso, user_id
         ))
     conn.close()
 
-    accounts = get_financial_accounts()
+    accounts = get_financial_accounts(user_id)
     for a in accounts:
         if a["id"] == acc_id:
             return a
     return {"id": acc_id, "name": name}
 
-def patch_financial_account(acc_id, patch_data):
+def patch_financial_account(acc_id, patch_data, user_id=DEFAULT_USER_ID):
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM financial_accounts WHERE id = ?", (acc_id,))
+    cur.execute("SELECT * FROM financial_accounts WHERE id = ? AND userId = ?", (acc_id, user_id))
     row = cur.fetchone()
     if not row:
         conn.close()
@@ -1045,18 +1083,18 @@ def patch_financial_account(acc_id, patch_data):
     curr.update(patch_data)
     curr["updatedAt"] = datetime.utcnow().isoformat() + "Z"
     conn.close()
-    return save_financial_account(curr)
+    return save_financial_account(curr, user_id)
 
-def delete_financial_account(acc_id):
+def delete_financial_account(acc_id, user_id=DEFAULT_USER_ID):
     conn = get_db()
     with conn:
-        res = conn.execute("DELETE FROM financial_accounts WHERE id = ?", (acc_id,))
+        res = conn.execute("DELETE FROM financial_accounts WHERE id = ? AND userId = ?", (acc_id, user_id))
         count = res.rowcount
     conn.close()
     return count > 0
 
-def mark_account_paid(acc_id):
-    accounts = get_financial_accounts()
+def mark_account_paid(acc_id, user_id=DEFAULT_USER_ID):
+    accounts = get_financial_accounts(user_id)
     target = None
     for a in accounts:
         if a["id"] == acc_id:
@@ -1111,6 +1149,6 @@ def mark_account_paid(acc_id):
     updated = patch_financial_account(acc_id, {
         "nextDueDate": next_due_date,
         "lastPaidDate": today_str
-    })
+    }, user_id=user_id)
 
     return updated

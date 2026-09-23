@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { X, RefreshCw, FolderCheck, Clock, CheckCircle2 } from 'lucide-react';
+import { X, RefreshCw, FolderCheck, Clock, CheckCircle2, ExternalLink } from 'lucide-react';
 
 export function DriveSyncModal({ isOpen, onClose, syncInfo = {}, onTriggerManualSync }) {
   const [syncing, setSyncing] = useState(false);
@@ -53,7 +53,19 @@ export function DriveSyncModal({ isOpen, onClose, syncInfo = {}, onTriggerManual
             <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '12px' }}>
               <FolderCheck size={20} color="#6558D3" />
               <div>
-                <div style={{ fontWeight: 700, fontSize: '15px' }}>{syncInfo.folderName || 'Ledgerly Financial Inbox'}</div>
+                {syncInfo.folderUrl ? (
+                  <a
+                    href={syncInfo.folderUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    style={{ fontWeight: 700, fontSize: '15px', color: '#6558D3', textDecoration: 'none', display: 'inline-flex', alignItems: 'center', gap: '5px' }}
+                  >
+                    <span>{syncInfo.folderName || 'Ledgerly Financial Inbox'}</span>
+                    <ExternalLink size={14} />
+                  </a>
+                ) : (
+                  <div style={{ fontWeight: 700, fontSize: '15px' }}>{syncInfo.folderName || 'Ledgerly Financial Inbox'}</div>
+                )}
                 <div style={{ fontSize: '12px', color: '#94A3B8' }}>Dedicated Google Drive import folder</div>
               </div>
             </div>
