@@ -12,6 +12,7 @@ from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 from db import (
     get_state,
@@ -36,7 +37,12 @@ logger = logging.getLogger("dhana_lakshmi.mcp")
 logger.setLevel(logging.INFO)
 
 # Initialize FastMCP Server
-mcp = FastMCP("Dhana Lakshmi Financial Platform")
+mcp = FastMCP(
+    "Dhana Lakshmi Financial Platform",
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=False
+    ),
+)
 logger.info("Dhana Lakshmi FastMCP server initialized.")
 
 
