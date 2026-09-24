@@ -19,7 +19,9 @@ RUN pip install --no-cache-dir \
     "uvicorn[standard]>=0.28.0" \
     pydantic>=2.6.0 \
     python-multipart>=0.0.9 \
-    pypdf>=4.0.0
+    pypdf>=4.0.0 \
+    "mcp>=1.3.0" \
+    fastmcp
 
 RUN mkdir -p /app/data /app/storage
 

@@ -906,8 +906,13 @@ async def sync_all_active_banks():
             "totalSynced": len(active_banks),
             "results": results
         }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+# Mount MCP SSE Server
+try:
+    from mcp_server import mcp as dhana_mcp
+    app.mount("/mcp", dhana_mcp.sse_app())
+    print("[MCP] Dhana Lakshmi FastMCP SSE server mounted successfully at /mcp/sse")
+except Exception as e:
+    print(f"[MCP] Warning: could not mount MCP SSE server: {e}")
 
 # Mount static files
 if (DIST_DIR / "assets").exists():
