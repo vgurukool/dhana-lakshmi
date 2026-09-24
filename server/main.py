@@ -906,6 +906,9 @@ async def sync_all_active_banks():
             "totalSynced": len(active_banks),
             "results": results
         }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 # Mount MCP SSE Server
 try:
     from mcp_server import mcp as dhana_mcp
