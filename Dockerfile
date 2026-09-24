@@ -20,8 +20,7 @@ RUN pip install --no-cache-dir \
     pydantic>=2.6.0 \
     python-multipart>=0.0.9 \
     pypdf>=4.0.0 \
-    "mcp>=1.3.0" \
-    fastmcp
+    "mcp>=1.3.0,<2.0.0"
 
 RUN mkdir -p /app/data /app/storage
 
